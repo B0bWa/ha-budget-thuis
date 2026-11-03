@@ -30,7 +30,13 @@ TOKEN = "fake-antiforgery"
 class FakeAccounts:
     """Minimal fake of accounts.budgetthuis.nl."""
 
-    def __init__(self, confirm_page: bool = False, meta_refresh: bool = False) -> None:
+    def __init__(
+        self,
+        confirm_page: bool = False,
+        meta_refresh: bool = False,
+        web_portal: bool = False,
+    ) -> None:
+        self.web_portal = web_portal
         self.confirm_page = confirm_page
         self.meta_refresh = meta_refresh
         self.challenge: str | None = None
@@ -45,9 +51,12 @@ class FakeAccounts:
         self.app.router.add_route("*", "/inloggen/bevestigen", self.confirm)
         self.app.router.add_get("/connect/authorize/callback", self.callback)
         self.app.router.add_post("/connect/token", self.token)
+        self.app.router.add_get("/portal", self.portal)
 
     async def authorize(self, request: web.Request) -> web.Response:
         self.challenge = request.query["code_challenge"]
+        if request.cookies.get("idsrv") == "session":
+            raise web.HTTPFound("budgetthuis://login_success?code=the-code")
         ret = "/connect/authorize/callback?" + request.query_string
         raise web.HTTPFound(f"/inloglink-aanvragen?returnUrl={quote(ret, safe='')}")
 
@@ -79,6 +88,12 @@ class FakeAccounts:
         if self.used or request.query.get("token") != "magic":
             return web.Response(content_type="text/html", text="<p>Link verlopen</p>")
         self.used = True
+        if self.web_portal:
+            # Real behaviour: the link signs in for the web portal and lands
+            # on its overview page, never returning to the app.
+            resp = web.HTTPFound("/portal")
+            resp.set_cookie("idsrv", "session")
+            raise resp
         if self.meta_refresh:
             resp = web.Response(
                 content_type="text/html",
@@ -96,6 +111,9 @@ class FakeAccounts:
         resp = web.HTTPFound(self.return_url)
         resp.set_cookie("idsrv", "session")
         raise resp
+
+    async def portal(self, request: web.Request) -> web.Response:
+        return web.Response(content_type="text/html", text="<title>Overzicht</title>")
 
     async def confirm(self, request: web.Request) -> web.Response:
         if self.meta_refresh:
@@ -130,11 +148,11 @@ async def _serve(fake: FakeAccounts) -> tuple[web.AppRunner, str]:
 
 
 @pytest.mark.parametrize(
-    ("confirm_page", "meta_refresh"), [(False, False), (True, False), (False, True)]
+    "mode", ["plain", "confirm_page", "meta_refresh", "web_portal"]
 )
-async def test_magic_link_login(confirm_page: bool, meta_refresh: bool) -> None:
+async def test_magic_link_login(mode: str) -> None:
     """Request a link, paste it, and get tokens."""
-    fake = FakeAccounts(confirm_page=confirm_page, meta_refresh=meta_refresh)
+    fake = FakeAccounts(**({mode: True} if mode != "plain" else {}))
     runner, base = await _serve(fake)
     try:
         login = _login(base)

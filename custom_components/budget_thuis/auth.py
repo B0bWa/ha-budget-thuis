@@ -29,7 +29,7 @@ import re
 import secrets
 import time
 from typing import Final, override
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 from aiobudgetthuis import BudgetThuisAuthError, BudgetThuisConnectionError, Tokens
 import aiohttp
@@ -197,18 +197,7 @@ class MagicLinkLogin:
         try:
             async with self._session() as s:
                 # 1. authorize -> (redirects) -> login-link request page
-                async with s.get(
-                    f"{self._accounts}/connect/authorize",
-                    params={
-                        "client_id": CLIENT_ID,
-                        "response_type": "code",
-                        "redirect_uri": REDIRECT_URI,
-                        "scope": SCOPE,
-                        "label": LABEL,
-                        "code_challenge": self._challenge,
-                        "code_challenge_method": "S256",
-                    },
-                ) as r:
+                async with s.get(self._authorize_url()) as r:
                     if r.status != _HTTP_OK:
                         raise BudgetThuisConnectionError(
                             f"authorize: status {r.status}"
@@ -267,7 +256,15 @@ class MagicLinkLogin:
         route: list[str] = []
         try:
             async with self._session() as s:
-                code = await self._follow(s, url, route)
+                try:
+                    code = await self._follow(s, url, route)
+                except BudgetThuisInvalidLinkError:
+                    # The mailed link is a web-portal auto-login: it signs in on
+                    # accounts.budgetthuis.nl but returns to mijn.budgetthuis.nl,
+                    # not to the app. That sign-in session is now in our cookie
+                    # jar, so a fresh app authorize completes without a prompt.
+                    route.append("retry app authorize")
+                    code = await self._follow(s, self._authorize_url(), route)
                 _LOGGER.debug("Login link route: %s", " -> ".join(route))
                 return await self._exchange(code, session=s)
         except BudgetThuisInvalidLinkError:
@@ -278,6 +275,21 @@ class MagicLinkLogin:
             raise
         except _TRANSPORT_ERRORS as err:
             raise BudgetThuisConnectionError(str(err)) from err
+
+    def _authorize_url(self) -> str:
+        query = urlencode(
+            {
+                "client_id": CLIENT_ID,
+                "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "scope": SCOPE,
+                "label": LABEL,
+                "code_challenge": self._challenge,
+                "code_challenge_method": "S256",
+            },
+            quote_via=quote,
+        )
+        return f"{self._accounts}/connect/authorize?{query}"
 
     async def _follow(
         self, s: aiohttp.ClientSession, url: str, route: list[str]
