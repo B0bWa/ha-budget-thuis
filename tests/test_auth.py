@@ -30,8 +30,9 @@ TOKEN = "fake-antiforgery"
 class FakeAccounts:
     """Minimal fake of accounts.budgetthuis.nl."""
 
-    def __init__(self, confirm_page: bool = False) -> None:
+    def __init__(self, confirm_page: bool = False, meta_refresh: bool = False) -> None:
         self.confirm_page = confirm_page
+        self.meta_refresh = meta_refresh
         self.challenge: str | None = None
         self.sent_to: str | None = None
         self.return_url: str | None = None
@@ -41,7 +42,7 @@ class FakeAccounts:
         self.app.router.add_get("/inloglink-aanvragen", self.link_page)
         self.app.router.add_post("/inloglink-aanvragen", self.link_post)
         self.app.router.add_get("/inloggen/link", self.magic)
-        self.app.router.add_post("/inloggen/bevestigen", self.confirm)
+        self.app.router.add_route("*", "/inloggen/bevestigen", self.confirm)
         self.app.router.add_get("/connect/authorize/callback", self.callback)
         self.app.router.add_post("/connect/token", self.token)
 
@@ -78,6 +79,13 @@ class FakeAccounts:
         if self.used or request.query.get("token") != "magic":
             return web.Response(content_type="text/html", text="<p>Link verlopen</p>")
         self.used = True
+        if self.meta_refresh:
+            resp = web.Response(
+                content_type="text/html",
+                text='<meta http-equiv="refresh" content="0;url=/inloggen/bevestigen">',
+            )
+            resp.set_cookie("idsrv", "session")
+            return resp
         if self.confirm_page:
             return web.Response(
                 content_type="text/html",
@@ -90,6 +98,8 @@ class FakeAccounts:
         raise resp
 
     async def confirm(self, request: web.Request) -> web.Response:
+        if self.meta_refresh:
+            raise web.HTTPFound(self.return_url)
         resp = web.HTTPFound(self.return_url)
         resp.set_cookie("idsrv", "session")
         raise resp
@@ -119,10 +129,12 @@ async def _serve(fake: FakeAccounts) -> tuple[web.AppRunner, str]:
     return runner, f"http://127.0.0.1:{port}"
 
 
-@pytest.mark.parametrize("confirm_page", [False, True])
-async def test_magic_link_login(confirm_page: bool) -> None:
+@pytest.mark.parametrize(
+    ("confirm_page", "meta_refresh"), [(False, False), (True, False), (False, True)]
+)
+async def test_magic_link_login(confirm_page: bool, meta_refresh: bool) -> None:
     """Request a link, paste it, and get tokens."""
-    fake = FakeAccounts(confirm_page=confirm_page)
+    fake = FakeAccounts(confirm_page=confirm_page, meta_refresh=meta_refresh)
     runner, base = await _serve(fake)
     try:
         login = _login(base)
@@ -174,12 +186,13 @@ async def _complete_http(login: MagicLinkLogin, link: str):
 
     def session():
         s = real()
-        orig_get = s.get
+        orig_request = s.request
 
-        def get(url, *args, **kwargs):
-            return orig_get(str(url).replace("https://", "http://", 1), *args, **kwargs)
+        def request(method, url, *args, **kwargs):
+            url = str(url).replace("https://", "http://", 1)
+            return orig_request(method, url, *args, **kwargs)
 
-        s.get = get
+        s.request = request
         return s
 
     login._session = session  # noqa: SLF001

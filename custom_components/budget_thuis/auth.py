@@ -21,13 +21,15 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 import hashlib
+from html import unescape
 from html.parser import HTMLParser
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Final, override
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from aiobudgetthuis import BudgetThuisAuthError, BudgetThuisConnectionError, Tokens
 import aiohttp
@@ -47,6 +49,16 @@ REQUEST_LINK_PATH: Final = "/inloglink-aanvragen"
 _REDIRECTS: Final = (301, 302, 303, 307, 308)
 _MAX_HOPS: Final = 15
 _HTTP_OK: Final = 200
+_MAX_FORMS: Final = 3
+_META_REFRESH_RE: Final = re.compile(
+    r"<meta[^>]+http-equiv=[\"']?refresh[^>]+content=[\"'][^\"']*?url=([^\"'>]+)",
+    re.IGNORECASE,
+)
+_JS_REDIRECT_RE: Final = re.compile(
+    r"(?:window\.|document\.)?location(?:\.href)?\s*(?:=|\.replace\(|\.assign\()\s*[\"']([^\"']+)[\"']"
+)
+_TITLE_RE: Final = re.compile(r"<(title|h1)[^>]*>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+_TAG_RE: Final = re.compile(r"<[^>]+>")
 _HTTP_CLIENT_ERROR: Final = 400
 _TIMEOUT: Final = aiohttp.ClientTimeout(total=30)
 _TRANSPORT_ERRORS: Final = (TimeoutError, aiohttp.ClientError, json.JSONDecodeError)
@@ -91,6 +103,28 @@ def _unwrap_link(link: str) -> str:
         if inner:
             return inner
     return link
+
+
+def _describe(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.hostname}{p.path}"
+
+
+def _soft_redirect(html: str) -> str | None:
+    """Return a meta-refresh or JavaScript redirect target, if the page has one."""
+    for regex in (_META_REFRESH_RE, _JS_REDIRECT_RE):
+        if m := regex.search(html):
+            return unescape(m.group(1).strip())
+    return None
+
+
+def _page_summary(html: str) -> str:
+    """Title/heading of a page, for logs (no body text: it may contain PII)."""
+    parts = [
+        " ".join(_TAG_RE.sub(" ", m.group(2)).split()) for m in _TITLE_RE.finditer(html)
+    ]
+    forms = [f.action or "(self)" for f in _parse_forms(html)]
+    return f"{' | '.join(p for p in parts if p)[:120]} forms={forms}"
 
 
 @dataclass
@@ -216,7 +250,7 @@ class MagicLinkLogin:
             raise BudgetThuisConnectionError(str(err)) from err
         self.link_requested_at = time.time()
 
-    async def async_complete(self, link: str) -> Tokens:  # noqa: PLR0912
+    async def async_complete(self, link: str) -> Tokens:
         """Open the pasted login link and exchange the resulting code for tokens."""
         url = _unwrap_link(link)
         if _is_app_redirect(url):
@@ -224,65 +258,67 @@ class MagicLinkLogin:
             return await self._exchange(self._code_from(url))
         parsed = urlparse(url)
         if parsed.scheme != "https" or not parsed.hostname:
+            _LOGGER.warning(
+                "Pasted login link is not an https link (starts with %r)", url[:12]
+            )
             raise BudgetThuisInvalidLinkError("not an https link")
 
+        # Only scheme/host/path are logged: queries carry one-time tokens.
+        route: list[str] = []
         try:
             async with self._session() as s:
-                submitted_form = False
-                for _ in range(_MAX_HOPS):
-                    async with s.get(url, allow_redirects=False) as r:
-                        if r.status in _REDIRECTS:
-                            loc = r.headers.get("Location")
-                            if not loc:
-                                raise BudgetThuisConnectionError(
-                                    "redirect without Location"
-                                )
-                            if _is_app_redirect(loc):
-                                return await self._exchange(
-                                    self._code_from(loc), session=s
-                                )
-                            url = urljoin(str(r.url), loc)
-                            continue
-                        if r.status != _HTTP_OK:
-                            raise BudgetThuisInvalidLinkError(
-                                f"login link: status {r.status}"
-                            )
-                        html = await r.text()
-                        page_url = str(r.url)
-
-                    # A 200 page: either an error ("link expired") or an
-                    # intermediate page with a confirm/auto-submit form.
-                    forms = [f for f in _parse_forms(html) if not f.has_email]
-                    if submitted_form or not forms:
-                        _LOGGER.debug(
-                            "Login link ended on %s without a code",
-                            urlparse(page_url).path,
-                        )
-                        raise BudgetThuisInvalidLinkError(
-                            "login link did not lead to an authorization code"
-                        )
-                    form = forms[0]
-                    submitted_form = True
-                    action = urljoin(page_url, form.action or page_url)
-                    if form.method == "post":
-                        async with s.post(
-                            action, data=form.fields, allow_redirects=False
-                        ) as r:
-                            loc = r.headers.get("Location")
-                            if r.status not in _REDIRECTS or not loc:
-                                raise BudgetThuisInvalidLinkError(
-                                    f"confirm form: status {r.status}"
-                                )
-                            if _is_app_redirect(loc):
-                                return await self._exchange(
-                                    self._code_from(loc), session=s
-                                )
-                            url = urljoin(str(r.url), loc)
-                    else:
-                        url = action
-                raise BudgetThuisConnectionError("too many redirects")
+                code = await self._follow(s, url, route)
+                _LOGGER.debug("Login link route: %s", " -> ".join(route))
+                return await self._exchange(code, session=s)
+        except BudgetThuisInvalidLinkError:
+            _LOGGER.warning(
+                "Login link did not yield an authorization code. Route: %s",
+                " -> ".join(route) or "(none)",
+            )
+            raise
         except _TRANSPORT_ERRORS as err:
             raise BudgetThuisConnectionError(str(err)) from err
+
+    async def _follow(
+        self, s: aiohttp.ClientSession, url: str, route: list[str]
+    ) -> str:
+        """Follow redirects, meta/JS redirects and confirm forms to the app code."""
+        method, data = "get", None
+        forms_submitted = 0
+        for _ in range(_MAX_HOPS):
+            async with s.request(method, url, data=data, allow_redirects=False) as r:
+                route.append(f"{method.upper()} {_describe(url)} [{r.status}]")
+                if r.status in _REDIRECTS:
+                    loc = r.headers.get("Location")
+                    if not loc:
+                        raise BudgetThuisConnectionError("redirect without Location")
+                    if _is_app_redirect(loc):
+                        route.append("budgetthuis://login_success")
+                        return self._code_from(loc)
+                    url, method, data = urljoin(str(r.url), loc), "get", None
+                    continue
+                if r.status != _HTTP_OK:
+                    raise BudgetThuisInvalidLinkError(f"status {r.status}")
+                html = await r.text()
+                page_url = str(r.url)
+
+            route.append(f"page {_page_summary(html)!r}")
+            if target := _soft_redirect(html):
+                if _is_app_redirect(target):
+                    return self._code_from(target)
+                url, method, data = urljoin(page_url, target), "get", None
+                continue
+            forms = [f for f in _parse_forms(html) if not f.has_email]
+            if not forms or forms_submitted >= _MAX_FORMS:
+                raise BudgetThuisInvalidLinkError("no authorization code")
+            form = forms[0]
+            forms_submitted += 1
+            url = urljoin(page_url, form.action or page_url)
+            method = "post" if form.method == "post" else "get"
+            data = dict(form.fields) if method == "post" else None
+            if method == "get" and form.fields:
+                url = f"{url}{'&' if '?' in url else '?'}{urlencode(form.fields)}"
+        raise BudgetThuisConnectionError("too many redirects")
 
     @staticmethod
     def _code_from(url: str) -> str:
